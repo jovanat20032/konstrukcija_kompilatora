@@ -1,1 +1,2 @@
 add_subdirectory(OurCSEPass)
+add_subdirectory(DeadBBElimPass)
