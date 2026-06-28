@@ -1,6 +1,8 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -19,10 +21,10 @@ struct DeadBBElimPass : public FunctionPass {
     // Ovde pamtim blokove do kojih moze da se dodje iz entry bloka
     std::unordered_set<BasicBlock*> ReachableBlocks;
 
-    // Ovde cuvam blokove koje kasnije treba obrisati
+    // Ovde cuvam blokove koje treba obrisati
     std::vector<BasicBlock*> BlocksToRemove;
 
-    // Obican DFS kroz CFG funkcije
+    // DFS kroz CFG funkcije
     void DFS(BasicBlock* Current) {
         if (ReachableBlocks.find(Current) != ReachableBlocks.end()) {
             return;
@@ -30,22 +32,26 @@ struct DeadBBElimPass : public FunctionPass {
 
         ReachableBlocks.insert(Current);
 
-        // Idemo kroz sve naslednike trenutnog bloka
+        // Obilazim sve naslednike trenutnog bloka
         for (BasicBlock* Successor : successors(Current)) {
             DFS(Successor);
         }
     }
 
     bool runOnFunction(Function& F) override {
+        DominatorTree& DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+
         ReachableBlocks.clear();
         BlocksToRemove.clear();
 
-        // Obilazak uvek krece od entry bloka funkcije
+        // Krecem od entry bloka jer je to pocetak svake funkcije
         DFS(&F.getEntryBlock());
 
         for (BasicBlock& BB : F) {
-            // Ako blok nije posecen DFS-om, onda je nedostizan
-            if (ReachableBlocks.find(&BB) == ReachableBlocks.end()) {
+            // Ako blok nije posecen DFS-om ili ga entry blok ne dominira,
+            // znaci da taj blok nije regularno dostizan
+            if (ReachableBlocks.find(&BB) == ReachableBlocks.end() ||
+                !DT.dominates(&F.getEntryBlock(), &BB)) {
                 BlocksToRemove.push_back(&BB);
             }
         }
@@ -54,14 +60,38 @@ struct DeadBBElimPass : public FunctionPass {
             return false;
         }
 
-        errs() << "Function " << F.getName() << " has unreachable blocks:\n";
+        errs() << "Function " << F.getName() << " has dead basic blocks:\n";
 
         for (BasicBlock* BB : BlocksToRemove) {
-            errs() << "  " << BB->getName() << "\n";
+            errs() << "  removing block: " << BB->getName() << "\n";
+
+            // Prvo uklanjam ovaj blok kao prethodnika njegovim naslednicima
+            // da ne ostanu PHI reference na blok koji brisem
+            std::vector<BasicBlock*> Succs;
+
+            for (BasicBlock* Succ : successors(BB)) {
+                Succs.push_back(Succ);
+            }
+
+            for (BasicBlock* Succ : Succs) {
+                Succ->removePredecessor(BB);
+            }
+
+            // Zatim brisem instrukcije iz bloka unazad
+            while (!BB->empty()) {
+                Instruction& I = BB->back();
+                I.dropAllReferences();
+                I.eraseFromParent();
+            }
+
+            BB->eraseFromParent();
         }
 
-        // Za sada samo pronalazimo blokove, brisanje ide u sledecem commitu
-        return false;
+        return true;
+    }
+
+    void getAnalysisUsage(AnalysisUsage& AU) const override {
+        AU.addRequired<DominatorTreeWrapperPass>();
     }
 };
 
