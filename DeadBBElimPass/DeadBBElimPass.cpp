@@ -24,7 +24,7 @@ struct DeadBBElimPass : public FunctionPass {
     // Ovde cuvam blokove koje treba obrisati
     std::vector<BasicBlock*> BlocksToRemove;
 
-    // DFS kroz CFG funkcije
+    // DFS od entry-ja
     void DFS(BasicBlock* Current) {
         if (ReachableBlocks.find(Current) != ReachableBlocks.end()) {
             return;
@@ -49,7 +49,6 @@ struct DeadBBElimPass : public FunctionPass {
 
         for (BasicBlock& BB : F) {
             // Ako blok nije posecen DFS-om ili ga entry blok ne dominira,
-            // znaci da taj blok nije regularno dostizan
             if (ReachableBlocks.find(&BB) == ReachableBlocks.end() ||
                 !DT.dominates(&F.getEntryBlock(), &BB)) {
                 BlocksToRemove.push_back(&BB);
@@ -65,8 +64,7 @@ struct DeadBBElimPass : public FunctionPass {
         for (BasicBlock* BB : BlocksToRemove) {
             errs() << "  removing block: " << BB->getName() << "\n";
 
-            // Prvo uklanjam ovaj blok kao prethodnika njegovim naslednicima
-            // da ne ostanu PHI reference na blok koji brisem
+        
             std::vector<BasicBlock*> Succs;
 
             for (BasicBlock* Succ : successors(BB)) {
@@ -77,7 +75,7 @@ struct DeadBBElimPass : public FunctionPass {
                 Succ->removePredecessor(BB);
             }
 
-            // Zatim brisem instrukcije iz bloka unazad
+            // brisem instrukcije iz bloka unazad
             while (!BB->empty()) {
                 Instruction& I = BB->back();
                 I.dropAllReferences();

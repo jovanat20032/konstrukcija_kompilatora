@@ -12,3 +12,4 @@ negative:
 dead:
   ret i32 100
 }
+

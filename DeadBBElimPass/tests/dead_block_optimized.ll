@@ -6,9 +6,8 @@ entry:
   %cmp = icmp sgt i32 %x, 0
   br i1 %cmp, label %positive, label %negative
 
-positive:                                         ; preds = %entry
+positive:                                         
   ret i32 1
 
-negative:                                         ; preds = %entry
-  ret i32 0
+negative:                                         
 }
