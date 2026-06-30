@@ -9,7 +9,6 @@
 
 #include <unordered_map>
 #include <vector>
-#include <unordered_map>
 
 using namespace llvm;
 
@@ -18,87 +17,223 @@ namespace{
 
     struct OurCSEPass : public FunctionPass {
 
-        static char ID; //nije bitna vrednost, nego samo adresa
+        static char ID;
 
-        std::unordered_map<Value*, Instruction*> LastSeenLoadInstruction; //za svaki pokazivac pamti poslednju load instrukciju koja je ucitana sa te adrese
+        std::unordered_map<Value*, Instruction*> LastSeenLoadInstruction;
+        
+        std::unordered_map<std::string, Instruction*> ExpressionMap;
 
-        std::unordered_map<std::string, Instruction*> ExpressionMap;// pamti izraze i instrukciju koja ih je izracunala
-
-        std::vector<Instruction*> InstructionsToRemove;//vektor u koji skupljamo instrukcije za brisanje
+        std::vector<Instruction*> InstructionsToRemove;
         OurCSEPass() : FunctionPass(ID) {}
+
+        bool isInteresting(Instruction *I) {
+            if (BinaryOperator *BO = dyn_cast<BinaryOperator>(I)) {
+                unsigned Opcode = BO->getOpcode();
+                return Opcode == Instruction::Add || 
+                    Opcode == Instruction::Sub || 
+                    Opcode == Instruction::Mul || 
+                    Opcode == Instruction::SDiv;
+            }
+    
+            if (isa<ICmpInst>(I)) {
+                return true;
+            }
+    
+            return false;
+        }
+        bool isFPType(Instruction *I) {
+            if (BinaryOperator* BO = dyn_cast<BinaryOperator>(I)) {
+                return BO->getType()->isFloatingPointTy();
+            }
+            if (ICmpInst* Cmp = dyn_cast<ICmpInst>(I)) {
+                if (Cmp->getOperand(0)->getType()->isFloatingPointTy()) {
+                    return true; 
+                }
+            }
+            return false;
+        }
+
+        bool isCommutative(Instruction *I) {
+            if (isa<ICmpInst>(I)) {
+                ICmpInst *Cmp = dyn_cast<ICmpInst>(I);
+                CmpInst::Predicate Pred = Cmp->getPredicate();
+                return Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE;
+            }
+            return isa<AddOperator>(I) || isa<MulOperator>(I);
+        }
+
+        std::string getOperandKey(Value *V) {
+            std::string Result;
+            raw_string_ostream RSO(Result);
+
+            if (!V->getName().empty()) {
+                RSO << V->getName().str();
+                return RSO.str();
+            }
+
+            if (ConstantInt *CI = dyn_cast<ConstantInt>(V)) {
+                RSO << "C" << CI->getSExtValue(); 
+                return RSO.str();
+            }
+            
+            RSO << V->getType()->getTypeID() << "_id" << (uintptr_t)V;
+            return RSO.str();
+        }
+
+        std::string generateExpressionKey(Instruction *I) {
+            std::string Key;
+            raw_string_ostream RSO(Key);
+            
+            if (isa<ICmpInst>(I)) {
+                ICmpInst *Cmp = dyn_cast<ICmpInst>(I);
+                RSO << "icmp_" << Cmp->getPredicate() << "_"; 
+            } else if (isa<BinaryOperator>(I)) {
+                BinaryOperator *BO = dyn_cast<BinaryOperator>(I);
+                RSO << BO->getOpcodeName() << " ";
+            } else {
+                return "";
+            }
+            
+            Value* LeftOp = I->getOperand(0);
+            Value* RightOp = I->getOperand(1);
+            
+            if (isCommutative(I)) {
+                std::string LeftKey = getOperandKey(LeftOp);
+                std::string RightKey = getOperandKey(RightOp);
+                
+                if (LeftKey > RightKey) {
+                    std::swap(LeftOp, RightOp);
+                }
+            }
+            
+            RSO << getOperandKey(LeftOp) << ", " << getOperandKey(RightOp);
+            
+            return RSO.str();
+        }
+
+        bool isTheSameInstruction(Instruction *I1, Instruction *I2) {
+            if (I1->getOpcode() != I2->getOpcode()) {
+                return false;
+            }
+
+            if (isa<ICmpInst>(I1) && isa<ICmpInst>(I2)) {
+                ICmpInst *Cmp1 = dyn_cast<ICmpInst>(I1);
+                ICmpInst *Cmp2 = dyn_cast<ICmpInst>(I2);
+                if (Cmp1->getPredicate() != Cmp2->getPredicate()) {
+                    return false; 
+                }
+            }
+            
+            return generateExpressionKey(I1) == generateExpressionKey(I2);
+        }
 
         bool runOnFunction(Function &F) override {
             
-            DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree(); //dohvata dominator stablo
+            DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
 
             bool Changed = false;
 
             errs() << "Pokrenut je CSE Pass za funkciju: " << F.getName() << "\n";
 
             LastSeenLoadInstruction.clear();
-            ExpressionMap.clear();//cistimo strukture na početku svake funkcije
+            ExpressionMap.clear();
             InstructionsToRemove.clear();
 
-            for(BasicBlock &BB : F){ //prolaz kroz sve basic blockove funkcije
-                for(Instruction &I : BB){ //prolaz kroz sve instrukcije basic blocka
-                    if(LoadInst* LoadInstr = dyn_cast<LoadInst>(&I)) {//citanje iz memorije
+            for(BasicBlock &BB : F){
+                for(Instruction &I : BB){
+                    if(LoadInst* LoadInstr = dyn_cast<LoadInst>(&I)) {
+                        if (LoadInstr->isVolatile()) {
+                            continue;
+                        }
+                        if (LoadInstr->getOrdering() != AtomicOrdering::NotAtomic) {
+                            continue;
+                        }
                         Value* PointerOperand = LoadInstr->getPointerOperand();
-                        if(LastSeenLoadInstruction.find(PointerOperand) != LastSeenLoadInstruction.end()) {//da li u mapi vec imamo citanje sa ove adrese
+                        if(LastSeenLoadInstruction.find(PointerOperand) != LastSeenLoadInstruction.end()) {
                             Instruction* PreviousInstr = LastSeenLoadInstruction[PointerOperand];
 
-                            if(DT.dominates(PreviousInstr, LoadInstr)) {//da li staro citanje dominira novim
-                                LoadInstr->replaceAllUsesWith(PreviousInstr); //svi koji koriste novo, neka koriste staro
-                                InstructionsToRemove.push_back(&I); //pakujemo za brisanje
+                            if(DT.dominates(PreviousInstr, LoadInstr)) {
+                                LoadInstr->replaceAllUsesWith(PreviousInstr);
+                                InstructionsToRemove.push_back(&I);
                                 Changed = true;
+                                continue;
                             }
                         }
-                        LastSeenLoadInstruction[PointerOperand] = &I;//azuriramo mapu: ovo je sada najsvezije citanje za ovu adresu
-                    }else if(StoreInst* StoreInstr = dyn_cast<StoreInst>(&I)) {//upis u memoriju
-                        Value* PointerOperand = StoreInstr->getPointerOperand();
-
-                        if(LastSeenLoadInstruction.find(PointerOperand) != LastSeenLoadInstruction.end()) {//ako neko upise novu vrednost, staro citanje vise ne važi i brisemo ga iz mape
-                            LastSeenLoadInstruction.erase(PointerOperand);
+                        LastSeenLoadInstruction[PointerOperand] = &I;
+                    }else if(StoreInst* StoreInstr = dyn_cast<StoreInst>(&I)) {
+                         if (StoreInstr->isVolatile()) {
+                            continue;
+                        }
+                        if (StoreInstr->getOrdering() != AtomicOrdering::NotAtomic) {
+                            continue;
+                        }
+                        LastSeenLoadInstruction.clear();
+                    }else if (CallInst* CI = dyn_cast<CallInst>(&I)) {
+                        if (!CI->onlyReadsMemory()) {
+                            LastSeenLoadInstruction.clear();
                         }
                     }else if(BinaryOperator* BO = dyn_cast<BinaryOperator>(&I)) {
-                        Value* LeftOp = BO->getOperand(0);
-                        Value* RightOp = BO->getOperand(1);
-
-                        if(BO->isCommutative() && LeftOp > RightOp) {//ako je operator komutativan sortira operande po adresi da dobijemo jedinstveni kljuc
-                            std::swap(LeftOp, RightOp);
+                        if (isFPType(BO)) {
+                            continue;
                         }
+                        
+                        if (!isInteresting(BO)) {
+                            continue;
+                        }
+                        std::string ExpressionKey = generateExpressionKey(BO);
 
-                        std::string Key;                  //string koji ce predstavljati jedinstveni izraz
-                        raw_string_ostream RSO(Key);      //strim za lako konstruisanje stringa
-
-                        RSO << BO->getOpcodeName() << " ";
-                        LeftOp->print(RSO);
-                        RSO << ", ";                     
-                        RightOp->print(RSO);
-
-                        std::string ExpressionKey = RSO.str();
-
-                        if(ExpressionMap.find(ExpressionKey) != ExpressionMap.end()) {//proveri da li smo vec videli isti izraz (isti operator i isti operandi)
-                            Instruction* PreviousInstr = ExpressionMap[ExpressionKey];//uzima prethodnu instrukciju koja je izracunala ovaj izraz
+                        if(ExpressionMap.find(ExpressionKey) != ExpressionMap.end()){
+                            Instruction* PreviousInstr = ExpressionMap[ExpressionKey];
                             
-                            if(DT.dominates(PreviousInstr, BO)) {//proveri da li prethodna instrukcija dominira trenutnu (da je prethodna uvek ranije)
-                            BO->replaceAllUsesWith(PreviousInstr);
-                            InstructionsToRemove.push_back(&I);
-                            Changed = true;
+                            if (!isTheSameInstruction(BO, PreviousInstr)) {
+                                ExpressionMap[ExpressionKey] = BO;
+                                continue;
+                            }
+                            
+                            if(DT.dominates(PreviousInstr, BO)){
+                                BO->replaceAllUsesWith(PreviousInstr);
+                                InstructionsToRemove.push_back(&I);
+                                Changed = true;
                             }
                         } else {
-                            ExpressionMap[ExpressionKey] = &I;//ako izraz nije viđen do sada, pamti ga u mapi
+                            ExpressionMap[ExpressionKey] = BO;
+                        }
+                    }else if(ICmpInst* Cmp = dyn_cast<ICmpInst>(&I)){
+                        if (!isInteresting(Cmp)) {
+                            continue;
+                        }
+                        if (isFPType(Cmp)) {
+                            continue;
+                        }
+                        std::string ExpressionKey = generateExpressionKey(Cmp);
+                        
+                        if(ExpressionMap.find(ExpressionKey) != ExpressionMap.end()){
+                            Instruction* PreviousInstr = ExpressionMap[ExpressionKey];
+
+                            if (!isTheSameInstruction(Cmp, PreviousInstr)) {
+                                ExpressionMap[ExpressionKey] = Cmp;
+                                continue;
+                            }
+                            
+                            if(DT.dominates(PreviousInstr, Cmp)){
+                                Cmp->replaceAllUsesWith(PreviousInstr);
+                                InstructionsToRemove.push_back(&I);
+                                Changed = true;
+                            }
+                        } else {
+                            ExpressionMap[ExpressionKey] = Cmp;
                         }
                     }
                 }
             }
 
-            for(Instruction* I : InstructionsToRemove) { //fizicko brisanje instrukcija tek na kraju, kada je potpuno bezbedno
+            for(Instruction* I : InstructionsToRemove) {
                 I->eraseFromParent();
             }
             return Changed;
         }
 
-        void getAnalysisUsage(AnalysisUsage &AU) const override { //pre passa se obezbedjuje izracuvavanje dominator stabla i takodje se navodi da se CFG ne menja
+        void getAnalysisUsage(AnalysisUsage &AU) const override {
             AU.addRequired<DominatorTreeWrapperPass>();
 
             AU.setPreservesCFG();
@@ -106,6 +241,6 @@ namespace{
     };
 }
 
-char OurCSEPass::ID = 0; //vrednost nije bitna, nego samo adresa
+char OurCSEPass::ID = 0;
 
-static RegisterPass<OurCSEPass> X("cse-pass", "Our CSE Pass", false, false); //argumenti su: argument za opt, ime passa, da li je CFG only, da li je analysis pass
+static RegisterPass<OurCSEPass> X("cse-pass", "Our CSE Pass", false, false); 

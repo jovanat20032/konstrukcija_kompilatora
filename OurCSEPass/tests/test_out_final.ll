@@ -7,3 +7,5 @@ entry:
   %z = add i32 %x, %x
   ret i32 %z
 }
+
+
